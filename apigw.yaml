@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+# ToDo:
+  # We should deny `apigateway:UpdateRestApiPolicy` for the IAM consumers
+  # Decision on CloudWatch Logs Role - required or not for multi deployment
+  # Retention set to 7 days for sample 
+
+Description: API Gateway Snippet
+Parameters:
+  pSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs to make the API available and accessible from
+  pVPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for connectivity to the API
+  pAPIName:
+    Type: String
+    Description: Name for the new API
+    Default: TestAPI
+    MinLength: 1
+  pEnvironment:
+    Type: String
+    AllowedValues: ["None", "Dev", "OML", "PreProd", "Prod"]
+    Default: Dev
+    Description: Environment type, this will configure a Stage automatically UNLESS None is specified.
+      If None is selected, CloudWatch Logs will not be enforced
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General"
+        Parameters:
+          - pAPIName
+          - pEnvironment
+      - Label:
+          default: "Network"
+        Parameters:
+          - pVPCId
+          - pSubnetIds
+    ParameterLabels:
+      pAPIName:
+        default: "Name"
+      pEnvironment:
+        default: "Environment Type"
+      pAPIName:
+        default: "Name for the API"
+      pVPCId:
+        default: "VPC ID"
+      pSubnetIds:
+        default: "Subnet ID (List)"
+
+Conditions: 
+  cCreateStages: !Not [!Equals [!Ref pEnvironment, "None"]]
+
+Resources:
+  rVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument: !Sub '{
+          "Statement": [
+              {
+                  "Principal": "*",
+                  "Action": [
+                      "execute-api:Invoke"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": [
+                      "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*"
+                  ]
+              }
+          ]
+      }'
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.execute-api
+      SubnetIds: !Ref pSubnetIds
+      VpcId: !Ref pVPCId
+  rAPI:
+    Type: AWS::ApiGateway::RestApi
+    DependsOn: [rVPCEndpoint]
+    Properties:
+      Name: !Ref pAPIName
+      Policy: !Sub '{
+          "Version": "2012-10-17",
+          "Statement": [
+              {
+                  "Effect": "Allow",
+                  "Principal": "*",
+                  "Action": "execute-api:Invoke",
+                  "Resource": [
+                      "execute-api:/*"
+                  ]
+              },
+              {
+                  "Effect": "Deny",
+                  "Principal": "*",
+                  "Action": "execute-api:Invoke",
+                  "Resource": [
+                      "execute-api:/*"
+                  ],
+                  "Condition" : {
+                      "StringNotEquals": {
+                          "aws:SourceVpce": "${rVPCEndpoint}"
+                      }
+                  }
+              }
+          ]
+      }'
+      EndpointConfiguration:
+        Types:
+          - PRIVATE
+        VpcEndpointIds:
+          - !Ref rVPCEndpoint
+
+  # Need a method to create a Stage
+  rAPIMockMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Condition: cCreateStages
+    Properties:
+      RestApiId: !Ref rAPI
+      ResourceId: !GetAtt rAPI.RootResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+  rAPIStage:
+    Type: AWS::ApiGateway::Stage
+    Condition: cCreateStages
+    DependsOn: [rLogGroup, rAPIMockMethod]
+    Properties:
+      AccessLogSetting:
+        DestinationArn: !GetAtt rLogGroup.Arn
+      StageName: !Ref pEnvironment
+      Description: !Sub "${pEnvironment} Stage for API"
+      RestApiId: !Ref rAPI
+      DeploymentId: !Ref rAPIDeployment
+      MethodSettings:
+        - LoggingLevel: "INFO"
+          DataTraceEnabled: true
+          HttpMethod: "*"
+          ResourcePath: "/*"
+  rAPIDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Condition: cCreateStages
+    DependsOn: [rAPIMockMethod]
+    Properties:
+      RestApiId: !Ref rAPI
+      Description: Deployment Stage
+
+  # CloudWatch Logs part
+  rCloudWatchRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  rAPIAccountSetting:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt rCloudWatchRole.Arn
+  rLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 7
+      LogGroupName: !Sub "API-${pAPIName}"
+
+Outputs:
+  oCreatedAPI:
+    Value: !Ref rAPI
+    Description: Your API
+  oCreatedURL:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/apigateway/home?region=${AWS::Region}#/apis/${rAPI}/resources'
+    Description: Your API Console Link
+  
